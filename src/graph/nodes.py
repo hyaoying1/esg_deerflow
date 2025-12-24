@@ -4,32 +4,69 @@
 import json
 import logging
 import os
+import re
+from collections import defaultdict, deque
+from decimal import Decimal
 from functools import partial
 from typing import Any, Annotated, Literal
 
+
+# LangChain / LangGraph
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
-from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.types import Command, interrupt
 
+
+# MCP / External Adapters
+from langchain_mcp_adapters.client import MultiServerMCPClient
+
+# Project: Agents & Config
 from src.agents import create_agent
 from src.config.agents import AGENT_LLM_MAP
 from src.config.configuration import Configuration
-from src.llms.llm import get_llm_by_type, get_llm_token_limit_by_type
+from ..config import SELECTED_SEARCH_ENGINE, SearchEngine
+
+# Project: LLMs
+from src.llms.llm import (
+    get_llm_by_type,
+    get_llm_token_limit_by_type,
+)
+
+
+# Project: Prompts & Planning
 from src.prompts.planner_model import Plan
 from src.prompts.template import apply_prompt_template
+
+
+# Project: Tools
 from src.tools import (
     crawl_tool,
     get_retriever_tool,
     get_web_search_tool,
     python_repl_tool,
 )
+from src.tools.connect_sql import get_connection, get_title_contents
 from src.tools.search import LoggedTavilySearch
-from src.utils.context_manager import ContextManager, validate_message_content
-from src.utils.json_utils import repair_json_output, sanitize_tool_response
+from src.tools.introductory_report_writing import main_report_writing_begining
 
-from ..config import SELECTED_SEARCH_ENGINE, SearchEngine
+
+# Project: ESG Rules & Logic
+from src.tools.esg_rules import IndustaryInfoRules, ReportInfoRules
+from src.esg_logic.writing_title_type import title_framework
+
+# Project: Utils
+from src.utils.context_manager import (
+    ContextManager,
+    validate_message_content,
+)
+from src.utils.json_utils import (
+    repair_json_output,
+    sanitize_tool_response,
+)
+
+# Project: Graph State & Helpers
 from .types import State
 from .utils import (
     build_clarified_topic_from_history,
@@ -39,7 +76,6 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
-
 
 @tool
 def handoff_to_planner(
@@ -253,6 +289,7 @@ def planner_node(
     plan_iterations = state["plan_iterations"] if state.get("plan_iterations", 0) else 0
 
     # For clarification feature: use the clarified research topic (complete history)
+    # (stop using the whole chat history and instead plan from a sigle, clean, clarified task statement
     if state.get("enable_clarification", False) and state.get(
         "clarified_research_topic"
     ):
@@ -271,6 +308,7 @@ def planner_node(
         # Normal mode: use full conversation history
         messages = apply_prompt_template("planner", state, configurable, state.get("locale", "en-US"))
 
+    # if already have background information
     if state.get("enable_background_investigation") and state.get(
         "background_investigation_results"
     ):
@@ -285,6 +323,7 @@ def planner_node(
             }
         ]
 
+    # decide which llm to use
     if configurable.enable_deep_thinking:
         llm = get_llm_by_type("reasoning")
     elif AGENT_LLM_MAP["planner"] == "basic":
@@ -300,20 +339,27 @@ def planner_node(
         )
 
     full_response = ""
+    # if is basic model, use invoke
+    # 非流式，一次性调用基础模型
     if AGENT_LLM_MAP["planner"] == "basic" and not configurable.enable_deep_thinking:
         response = llm.invoke(messages)
+        # return jason format or just content
         if hasattr(response, "model_dump_json"):
             full_response = response.model_dump_json(indent=4, exclude_none=True)
         else:
             full_response = get_message_content(response) or ""
+    # 流式调用resoning模型
+    # 流式（stream）：模型一边想、一边吐字 → 边生成边返回
     else:
         response = llm.stream(messages)
+        # 拼接流式输出
         for chunk in response:
             full_response += chunk.content
     logger.debug(f"Current state messages: {state['messages']}")
     logger.info(f"Planner response: {full_response}")
 
     # Validate explicitly that response content is valid JSON before proceeding to parse it
+    # json外观校验
     if not full_response.strip().startswith('{') and not full_response.strip().startswith('['):
         logger.warning("Planner response does not appear to be valid JSON")
         if plan_iterations > 0:
@@ -506,273 +552,149 @@ def human_feedback_node(
 
 def coordinator_node(
     state: State, config: RunnableConfig
-) -> Command[Literal["planner", "background_investigator", "coordinator", "__end__"]]:
-    """Coordinator node that communicate with customers and handle clarification."""
+) -> Command[
+    Literal["planner", "background_investigator", "coordinator", "get_content", "__end__"]
+]:
     logger.info("Coordinator talking.")
-    configurable = Configuration.from_runnable_config(config)
 
-    # Check if clarification is enabled
-    enable_clarification = state.get("enable_clarification", False)
-    initial_topic = state.get("research_topic", "")
-    clarified_topic = initial_topic
-    # ============================================================
-    # BRANCH 1: Clarification DISABLED (Legacy Mode)
-    # ============================================================
-    if not enable_clarification:
-        # Use normal prompt with explicit instruction to skip clarification
-        messages = apply_prompt_template("coordinator", state, locale=state.get("locale", "en-US"))
-        messages.append(
-            {
-                "role": "system",
-                "content": "CRITICAL: Clarification is DISABLED. You MUST immediately call handoff_to_planner tool with the user's query as-is. Do NOT ask questions or mention needing more information.",
-            }
-        )
+    # 1. ESG 总控阶段（来自 run_agent_workflow_async 的第一个 graph）
+    if state.get("workflow_stage") == "esg_prepare":
+        logger.info("Detected ESG writing task → routing to get_content")
 
-        # Only bind handoff_to_planner tool
-        tools = [handoff_to_planner]
-        response = (
-            get_llm_by_type(AGENT_LLM_MAP["coordinator"])
-            .bind_tools(tools)
-            .invoke(messages)
-        )
+        messages = state.get("messages", [])
+        user_msg = messages[-1].content.strip()
 
-        goto = "__end__"
-        locale = state.get("locale", "en-US")
-        logger.info(f"Coordinator locale: {locale}")
-        research_topic = state.get("research_topic", "")
+        m1 = re.search(r"report_id\s*=\s*(\d+)", user_msg)
+        m2 = re.search(r"tenant_id\s*=\s*(\d+)", user_msg)
+        m3 = re.search(r"title_id\s*=\s*(\d+)", user_msg)
+        m4 = re.search(r"title_text\s*=\s*([^,]+)", user_msg)
 
-        # Process tool calls for legacy mode
-        if response.tool_calls:
-            try:
-                for tool_call in response.tool_calls:
-                    tool_name = tool_call.get("name", "")
-                    tool_args = tool_call.get("args", {})
+        report_id = int(m1.group(1)) if m1 else None
+        tenant_id = int(m2.group(1)) if m2 else None
+        title_id = int(m3.group(1)) if m3 else None
+        title_text = m4.group(1).strip() if m4 else ""
 
-                    if tool_name == "handoff_to_planner":
-                        logger.info("Handing off to planner")
-                        goto = "planner"
-
-                        # Extract research_topic if provided
-                        if tool_args.get("research_topic"):
-                            research_topic = tool_args.get("research_topic")
-                        break
-
-            except Exception as e:
-                logger.error(f"Error processing tool calls: {e}")
-                goto = "planner"
-
-    # ============================================================
-    # BRANCH 2: Clarification ENABLED (New Feature)
-    # ============================================================
-    else:
-        # Load clarification state
-        clarification_rounds = state.get("clarification_rounds", 0)
-        clarification_history = list(state.get("clarification_history", []) or [])
-        clarification_history = [item for item in clarification_history if item]
-        max_clarification_rounds = state.get("max_clarification_rounds", 3)
-
-        # Prepare the messages for the coordinator
-        state_messages = list(state.get("messages", []))
-        messages = apply_prompt_template("coordinator", state, locale=state.get("locale", "en-US"))
-
-        clarification_history = reconstruct_clarification_history(
-            state_messages, clarification_history, initial_topic
-        )
-        clarified_topic, clarification_history = build_clarified_topic_from_history(
-            clarification_history
-        )
-        logger.debug("Clarification history rebuilt: %s", clarification_history)
-
-        if clarification_history:
-            initial_topic = clarification_history[0]
-            latest_user_content = clarification_history[-1]
-        else:
-            latest_user_content = ""
-
-        # Add clarification status for first round
-        if clarification_rounds == 0:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": "Clarification mode is ENABLED. Follow the 'Clarification Process' guidelines in your instructions.",
-                }
-            )
-
-        current_response = latest_user_content or "No response"
         logger.info(
-            "Clarification round %s/%s | topic: %s | current user response: %s",
-            clarification_rounds,
-            max_clarification_rounds,
-            clarified_topic or initial_topic,
-            current_response,
+            f"Parsed ESG args: report_id={report_id}, tenant_id={tenant_id}, title_id={title_id}"
         )
 
-        clarification_context = f"""Continuing clarification (round {clarification_rounds}/{max_clarification_rounds}):
-            User's latest response: {current_response}
-            Ask for remaining missing dimensions. Do NOT repeat questions or start new topics."""
-
-        messages.append({"role": "system", "content": clarification_context})
-
-        # Bind both clarification tools - let LLM choose the appropriate one
-        tools = [handoff_to_planner, handoff_after_clarification]
-
-        # Check if we've already reached max rounds
-        if clarification_rounds >= max_clarification_rounds:
-            # Max rounds reached - force handoff by adding system instruction
-            logger.warning(
-                f"Max clarification rounds ({max_clarification_rounds}) reached. Forcing handoff to planner. Using prepared clarified topic: {clarified_topic}"
-            )
-            # Add system instruction to force handoff - let LLM choose the right tool
-            messages.append(
-                {
-                    "role": "system",
-                    "content": f"MAX ROUNDS REACHED. You MUST call handoff_after_clarification (not handoff_to_planner) with the appropriate locale based on the user's language and research_topic='{clarified_topic}'. Do not ask any more questions.",
-                }
-            )
-
-        response = (
-            get_llm_by_type(AGENT_LLM_MAP["coordinator"])
-            .bind_tools(tools)
-            .invoke(messages)
+        return Command(
+            update={
+                "task_type": "esg_write",
+                "esg_report_id": report_id,
+                "esg_tenant_id": tenant_id,
+                "esg_title_id": title_id,
+                "esg_title_text": title_text,
+                "raw_esg_input": user_msg,
+            },
+            goto="get_content",
         )
-        logger.debug(f"Current state messages: {state['messages']}")
 
-        # Initialize response processing variables
-        goto = "__end__"
-        locale = state.get("locale", "en-US")
-        research_topic = (
-            clarification_history[0]
-            if clarification_history
-            else state.get("research_topic", "")
+    # 2. ESG 分段写作阶段（来自 write_esg_report_part）
+    if state.get("workflow_stage") == "esg_part_write":
+        logger.info("Detected ESG part writing stage → skip get_content")
+        return Command(
+            update={},
+            goto="process_single_title",  
         )
-        if not clarified_topic:
-            clarified_topic = research_topic
 
-        # --- Process LLM response ---
-        # No tool calls - LLM is asking a clarifying question
-        if not response.tool_calls and response.content:
-            # Check if we've reached max rounds - if so, force handoff to planner
-            if clarification_rounds >= max_clarification_rounds:
-                logger.warning(
-                    f"Max clarification rounds ({max_clarification_rounds}) reached. "
-                    "LLM didn't call handoff tool, forcing handoff to planner."
-                )
-                goto = "planner"
-                # Continue to final section instead of early return
-            else:
-                # Continue clarification process
-                clarification_rounds += 1
-                # Do NOT add LLM response to clarification_history - only user responses
-                logger.info(
-                    f"Clarification response: {clarification_rounds}/{max_clarification_rounds}: {response.content}"
-                )
+def get_content_node(state: State, config: RunnableConfig):
+    report_id = state.get("esg_report_id")
+    title_id = state.get("esg_title_id")
+    tenant_id = state.get("esg_tenant_id")
 
-                # Append coordinator's question to messages
-                updated_messages = list(state_messages)
-                if response.content:
-                    updated_messages.append(
-                        HumanMessage(content=response.content, name="coordinator")
-                    )
-
-                return Command(
-                    update={
-                        "messages": updated_messages,
-                        "locale": locale,
-                        "research_topic": research_topic,
-                        "resources": configurable.resources,
-                        "clarification_rounds": clarification_rounds,
-                        "clarification_history": clarification_history,
-                        "clarified_research_topic": clarified_topic,
-                        "is_clarification_complete": False,
-                        "goto": goto,
-                        "__interrupt__": [("coordinator", response.content)],
-                    },
-                    goto=goto,
-                )
-        else:
-            # LLM called a tool (handoff) or has no content - clarification complete
-            if response.tool_calls:
-                logger.info(
-                    f"Clarification completed after {clarification_rounds} rounds. LLM called handoff tool."
-                )
-            else:
-                logger.warning("LLM response has no content and no tool calls.")
-            # goto will be set in the final section based on tool calls
-
-    # ============================================================
-    # Final: Build and return Command
-    # ============================================================
-    messages = list(state.get("messages", []) or [])
-    if response.content:
-        messages.append(HumanMessage(content=response.content, name="coordinator"))
-
-    # Process tool calls for BOTH branches (legacy and clarification)
-    if response.tool_calls:
-        try:
-            for tool_call in response.tool_calls:
-                tool_name = tool_call.get("name", "")
-                tool_args = tool_call.get("args", {})
-
-                if tool_name in ["handoff_to_planner", "handoff_after_clarification"]:
-                    logger.info("Handing off to planner")
-                    goto = "planner"
-
-                    if not enable_clarification and tool_args.get("research_topic"):
-                        research_topic = tool_args["research_topic"]
-
-                    if enable_clarification:
-                        logger.info(
-                            "Using prepared clarified topic: %s",
-                            clarified_topic or research_topic,
-                        )
-                    else:
-                        logger.info(
-                            "Using research topic for handoff: %s", research_topic
-                        )
-                    break
-
-        except Exception as e:
-            logger.error(f"Error processing tool calls: {e}")
-            goto = "planner"
-    else:
-        # No tool calls detected - fallback to planner instead of ending
-        logger.warning(
-            "LLM didn't call any tools. This may indicate tool calling issues with the model. "
-            "Falling back to planner to ensure research proceeds."
-        )
-        # Log full response for debugging
-        logger.debug(f"Coordinator response content: {response.content}")
-        logger.debug(f"Coordinator response object: {response}")
-        # Fallback to planner to ensure workflow continues
-        goto = "planner"
-
-    # Apply background_investigation routing if enabled (unified logic)
-    if goto == "planner" and state.get("enable_background_investigation"):
-        goto = "background_investigator"
-
-    # Set default values for state variables (in case they're not defined in legacy mode)
-    if not enable_clarification:
-        clarification_rounds = 0
-        clarification_history = []
-
-    clarified_research_topic_value = clarified_topic or research_topic
-
-    # clarified_research_topic: Complete clarified topic with all clarification rounds
+    text_results, company_name = get_title_contents(report_id, tenant_id, title_id)
     return Command(
         update={
-            "messages": messages,
-            "locale": locale,
-            "research_topic": research_topic,
-            "clarified_research_topic": clarified_research_topic_value,
-            "resources": configurable.resources,
-            "clarification_rounds": clarification_rounds,
-            "clarification_history": clarification_history,
-            "is_clarification_complete": goto != "coordinator",
-            "goto": goto,
+            "esg_company_name": company_name,
+            "esg_title_datas": text_results,
+            "goto": "check_title_tag",
         },
-        goto=goto,
+        goto="check_title_tag",
     )
 
+async def check_title_tag_node(state: State, config: RunnableConfig):
+    title_datas = state.get("esg_title_datas", [])
+    report_id = state.get("esg_report_id")
+    tenant_id = state.get("esg_tenant_id")
+    
+    title_in_framework = await title_framework(title_datas[0]['title'],
+                                                   [title_datas[i]['title'] for i in range(1, len(title_datas))],
+                                                   [title_datas[i]['topic_info_rules'] for i in range(len(title_datas))])
+    writing_tag = title_in_framework['title_in_framework']
+    logger.info(f"writing_tag： {writing_tag}")
+    if writing_tag not in ['董事会声明', '管理层致辞', '关于#企业#', '关于本报告']:
+        title_ids = []
+        for title_data in title_datas:
+            if title_data['title_id'] not in title_ids:
+                title_ids.append(title_data['title_id'])
+        title_contents = []
+        for title_id in title_ids:
+            title_content = {}
+            title_content['report_id'] = report_id
+            title_content['tenant_id'] = tenant_id
+            title_content['title_id'] = title_id
+            title_content['sub_title'] = []
+            for title_data in title_datas:
+                if title_data['title_id'] == title_id:
+                    title_content['title'] = title_data['title']
+                    title_content['parent_id'] = title_data['parent_id']
+                    title_content['topic_info_rules'] = title_data['topic_info_rules']
+                    sub_title = {'sub_title_name': title_data['sub_title_name'],
+                                    'sub_title_content': title_data['sub_title_content'],
+                                    'sub_title_topic': title_data['sub_title_topic'],
+                                    'sub_title_raw_data': title_data['sub_title_raw_data'] if title_data['sub_title_raw_data'] else ''}
+                    title_content['sub_title'].append(sub_title)
+            title_contents.append(title_content)
+        print(title_contents)
+        return Command(
+            update={
+                "esg_title_contents_raw": title_contents,
+                "esg_writing_tag": writing_tag,
+            },
+            goto="industrial_researcher"
+        )
+    else:
+        title_contents = []
+        return Command(
+            update = {
+                "esg_writing_tag": writing_tag,
+            },
+            goto="write_introductory"
+        )
+
+async def write_introductory_node(state: State, config: RunnableConfig):
+    title_datas = state.get("esg_title_datas", [])
+    writing_tag = state.get("esg_writing_tag")
+    company_name = state.get("esg_company_name")
+    report_id = state.get("esg_report_id")
+    tenant_id = state.get("esg_tenant_id")
+    content = ''
+    for title_data in title_datas:
+        content += title_data['content'] + '/n'
+    writing = await main_report_writing_begining(title_datas[0]['title'], writing_tag, company_name, content)
+    result = []
+    exist_title = []
+    for i, title_data in enumerate(title_datas):
+        result_i = {}
+        result_i['report_id'] = report_id
+        result_i['tenant_id'] = tenant_id
+        result_i['title_id'] = title_data['title_id']
+        result_i['title'] = title_data['title']
+        result_i['parent_id'] = title_data['parent_id']
+        if i == 0:
+            result_i['writing_content'] = writing
+        else:
+            result_i['writing_content']= ''
+        if result_i['title_id'] not in exist_title:
+            result.append(result_i)
+            exist_title.append(result_i['title_id'])
+    return Command(
+        update={
+            "esg_part_report_result": result
+        },
+        goto="__end__"
+    )
 
 def reporter_node(state: State, config: RunnableConfig):
     """Reporter node that write a final report."""
@@ -821,6 +743,8 @@ def reporter_node(state: State, config: RunnableConfig):
 
     return {"final_report": response_content}
 
+def researcher_node(state: State, config: RunnableConfig):
+    pass
 
 def research_team_node(state: State):
     """Research team node that collaborates on tasks."""
@@ -1175,32 +1099,260 @@ async def _setup_and_execute_agent_step(
         return await _execute_agent_step(state, agent, agent_type, config)
 
 
-async def researcher_node(
-    state: State, config: RunnableConfig
-) -> Command[Literal["research_team"]]:
-    """Researcher node that do research"""
-    logger.info("Researcher node is researching.")
-    logger.debug(f"[researcher_node] Starting researcher agent")
+async def industrial_researcher_node(state: State, config: RunnableConfig, model='qwen-max') -> Command:
+    logger.info("[researcher_node] Start ESG research")
+    company_name = state.get("esg_company_name")
     
-    configurable = Configuration.from_runnable_config(config)
-    logger.debug(f"[researcher_node] Max search results: {configurable.max_search_results}")
-    
-    tools = [get_web_search_tool(configurable.max_search_results), crawl_tool]
-    retriever_tool = get_retriever_tool(state.get("resources", []))
-    if retriever_tool:
-        logger.debug(f"[researcher_node] Adding retriever tool to tools list")
-        tools.insert(0, retriever_tool)
-    
-    logger.info(f"[researcher_node] Researcher tools count: {len(tools)}")
-    logger.debug(f"[researcher_node] Researcher tools: {[tool.name if hasattr(tool, 'name') else str(tool) for tool in tools]}")
-    logger.info(f"[researcher_node] enforce_researcher_search is set to: {configurable.enforce_researcher_search}")
-    
-    return await _setup_and_execute_agent_step(
-        state,
-        config,
-        "researcher",
-        tools,
+    llm = get_llm_by_type("basic")
+    parser = JsonOutputParser(pydantic_object=IndustaryInfoRules)
+    format_instructions = parser.get_format_instructions()
+
+    system_prompt = f"""
+    任务：根据公司名称和网络搜索主营业务文本，总结公司所属行业，输出公司所属行业和主营业务，如搜索到相应的上市公司主体名称和对应行业和主营业务，如’金蝶‘对应‘金蝶国际软件集团有限公司’再寻找主营业务和行业软件业，如未搜索到所属行业和业务信息，输出为：无特点行业。
+
+    你需要按照以下格式返回结果：
+    {format_instructions}
+    """
+    user_prompt = f"""以下是公司名称：{company_name}"""
+    company_industary_info_result = await llm.ainvoke([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ])
+    try:
+        parsed = parser.parse(company_industary_info_result.content)
+        print("✅ JSON 解析成功，返回模型对象")
+        print("解析结果：", parsed)
+        # 强制转为模型对象（确保返回类型一致）
+        if isinstance(parsed, dict):
+            company_info = IndustaryInfoRules(**parsed)
+    except Exception as e:
+        print(f"⚠️ JSON 解析失败，返回原始内容: {e}")
+        print("原始返回内容：", company_industary_info_result)
+        # 兜底策略：直接返回空结构
+        try:
+            company_industary_info = parser.parse(company_industary_info_result.content)
+            company_info = IndustaryInfoRules(industry=company_industary_info['industry'],
+                                      main_business=company_industary_info['main_business'])
+            print("尝试从解析后的内容中构建模型对象")
+        except:
+            company_info = IndustaryInfoRules(industry='', main_business='')
+            print("最终返回空结构")
+    company_information_texts = getattr(company_info, "industry", "") or ""
+    return Command(
+        update={
+            "esg_company_industry": company_information_texts,
+            "goto": "__end__",
+        },
+        goto="__end__",
     )
+
+async def process_single_title_node(state: State) -> Command:
+    """
+    Node: Process a single ESG title content.
+    Responsibility:
+    - Extract title / raw_text / sub_title_topics
+    - Update state with prepared writing inputs
+    - Route to get_law_info node
+    """
+    logger.info("[process_single_title_node] Start processing single title")
+
+    # 1. 从 state 里取 workflow 已经喂进来的数据
+    title_content = state.get("esg_title_contents_raw")
+
+    if not title_content:
+        logger.warning("No esg_title_content found in state")
+        return Command(goto="__end__")
+
+    # 2. 提取 title / raw_text / sub_title_topics
+    title = title_content.get("title")
+
+    raw_text = ""
+    sub_title_topics = set()
+
+    for sub_title in title_content.get("sub_title", []):
+        if sub_title.get("sub_title_raw_data"):
+            raw_text += sub_title["sub_title_raw_data"] + "\n"
+        else:
+            raw_text += sub_title.get("sub_title_content", "")
+
+        topic = sub_title.get("sub_title_topic")
+        if topic:
+            sub_title_topics.add(topic)
+
+    logger.info(
+        f"[process_single_title_node] title={title}, topics={sub_title_topics}"
+    )
+
+    # 3. 把“下一阶段需要的信息”写入 state
+    return Command(
+        update={
+            # 写作输入（供后续 node 使用）
+            "current_title": title,
+            "current_raw_text": raw_text,
+            "current_sub_title_topics": list(sub_title_topics),
+        },
+        goto="get_laws_info",
+    )
+
+
+async def get_laws_info_node(state: State) -> Command:
+    """
+    Node: Get laws and regulations information.
+    """
+    logger.info("[get_laws_info_node] Start getting laws information")
+
+    sub_title_topics = state.get("current_sub_title_topics", [])
+    company_information_texts = state.get("esg_company_industry", "")
+
+    if not sub_title_topics:
+        logger.warning("No sub_title_topics found in state")
+        return Command(goto="__end__")
+
+    llm = get_llm_by_type("basic")
+
+    topics_text = "；".join(sub_title_topics)
+
+    user_prompt = (
+        f"请基于以下主题：{topics_text}，并结合企业行业背景："
+        f"{company_information_texts}，"
+        f"梳理国内外相关法律法规、条例或管理办法中"
+        f"与这些主题直接相关的具体条目和内容。"
+        f"请用中文回答，结构清晰。"
+    )
+
+    law_info_result = await llm.ainvoke(
+        [{"role": "user", "content": user_prompt}]
+    )
+    return Command(
+        update={
+            "law_info_text": law_info_result.content,
+        },
+        goto="esg_write_report",  # 或下一个 node，如 "write_report_part"
+    )
+
+
+async def esg_write_report_node(state: State) -> Command:
+    """
+    Node: Write ESG report content for a single title.
+    - Use prompt from src/prompts/write_report.md
+    - Stream LLM output
+    - Parse JSON result with ReportInfoRules
+    """
+    llm = get_llm_by_type("reasoning")
+    parser = JsonOutputParser(pydantic_object=ReportInfoRules)
+    format_instructions = parser.get_format_instructions()
+
+    data_text = state.get("current_raw_text", "")
+    laws_info = state.get("law_info_text", "")
+
+
+    prompt_state = {
+        **state,
+        "format_instructions": format_instructions,
+        "data_text": data_text,
+        "laws_info": laws_info,
+    }
+
+    messages = apply_prompt_template(
+        "write_report",          
+        prompt_state,
+        configurable=None,
+        locale=state.get("locale", "zh-CN"),
+    )
+
+    output_text = ""
+    logger.info("📘 开始生成报告内容（流式输出）")
+
+    async for chunk in llm.astream(messages):
+        if chunk.content:
+            print(chunk.content, end="", flush=True)
+            output_text += chunk.content
+
+
+    report_result = parser.parse(output_text)
+    return Command(
+        update={
+            "esg_part_report_result": report_result,
+        },
+        goto="create_table_of_contents",  
+    )
+
+async def create_table_of_contents_node(state: State) -> Command:
+    sub_title_topics = state.get("current_sub_title_topics", [])
+    report_id = state.get("esg_report_id")
+    tenant_id = state.get("esg_tenant_id")
+
+    tables = []
+    connection = get_connection()
+    with connection.cursor() as cursor:
+        for sub_title_topic in sub_title_topics:
+            if sub_title_topic.upper() != 'SASB':
+                table = []
+                sql_indicator_topic = f'''SELECT DISTINCT indicator_name FROM t_esg_indicator 
+                WHERE report_id = {abs(report_id)} AND tenant_id = {tenant_id} and deleted = 0 
+                AND topic_tags LIKE '%{sub_title_topic}%'
+                '''
+                cursor.execute(sql_indicator_topic)
+                raw_indicator_results = cursor.fetchall()
+
+                if not raw_indicator_results:
+                    print(f"⚠️ 未找到匹配议题：{sub_title_topics}")
+                    continue
+
+                indicator_results = [list(d.values())[0] for d in raw_indicator_results]
+
+                for indicator_result in indicator_results:
+                    sql_data = f'''SELECT * FROM t_esg_indicator_data 
+                    WHERE report_id = {abs(report_id)} AND tenant_id = {tenant_id} and deleted = 0 AND name = '{indicator_result}'
+                    '''
+                    cursor.execute(sql_data)
+                    raw_data_results = cursor.fetchall()
+
+                    if not raw_data_results:
+                        print(f"⚠️ 议题 {indicator_result} 无数据")
+                        continue
+
+                    for data_result in raw_data_results:
+                        table.append({'name': indicator_result, 'year': data_result['year'], 'value': data_result['value']})
+
+                if not table:
+                    print(f"⚠️ 议题 {sub_title_topic} 无可用表格数据")
+                    return ""
+
+                years = sorted(set(item['year'] for item in table), reverse=True)
+                table_data = defaultdict(dict)
+
+                def normalize_value(value):
+                    if value is None:
+                        return ""
+                    if isinstance(value, (int, float, Decimal)):
+                        return f"{float(value):.2f}"
+                    return str(value)
+
+                for item in table:
+                    table_data[item['name']][item['year']] = normalize_value(item.get('value'))
+
+                header = "| 指标名称 | " + " | ".join(str(y) for y in years) + " |"
+                separator = "|-----------|" + "|".join(["-----------"] * len(years)) + "|"
+
+                rows = []
+                for name, values in table_data.items():
+                    row = [name] + [values.get(y, "") for y in years]
+                    rows.append("| " + " | ".join(row) + " |")
+
+                markdown_table = "\n".join([header, separator] + rows)
+                print(f"————————————{sub_title_topic}————————————")
+                print(markdown_table)
+                tables.append(markdown_table)
+    connection.close()
+    return Command(
+        update={
+            "esg_part_tables_markdown": tables,
+        },
+        goto="__end__",
+    )
+
+
 
 
 async def coder_node(

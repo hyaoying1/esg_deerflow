@@ -7,6 +7,7 @@ from typing import Literal
 LLMType = Literal["basic", "reasoning", "vision", "code"]
 
 # Define agent-LLM mapping
+# act like a set of allowed keys to llm
 AGENT_LLM_MAP: dict[str, LLMType] = {
     "coordinator": "basic",
     "planner": "basic",

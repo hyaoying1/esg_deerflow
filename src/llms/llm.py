@@ -16,13 +16,17 @@ from src.config import load_yaml_config
 from src.config.agents import LLMType
 from src.llms.providers.dashscope import ChatDashscope
 
+# create logger instance
 logger = logging.getLogger(__name__)
 
 # Cache for LLM instances
+# key: LLMType (basic, reasoning, vision, code)
+# value: LLM instance
 _llm_cache: dict[LLMType, BaseChatModel] = {}
 
 # Allowed LLM configuration keys to prevent unexpected parameters from being passed
 # to LLM constructors (Issue #411 - SEARCH_ENGINE warning fix)
+# a set of allowed keys to llm configuration
 ALLOWED_LLM_CONFIG_KEYS = {
     # Common LLM configuration keys
     "model",
@@ -67,12 +71,11 @@ ALLOWED_LLM_CONFIG_KEYS = {
     "default_query",
 }
 
-
 def _get_config_file_path() -> str:
     """Get the path to the configuration file."""
     return str((Path(__file__).parent.parent.parent / "conf.yaml").resolve())
 
-
+# when i want a reasoning llm, which part i should look at in conf.yaml
 def _get_llm_type_config_keys() -> dict[str, str]:
     """Get mapping of LLM types to their configuration keys."""
     return {
@@ -82,7 +85,11 @@ def _get_llm_type_config_keys() -> dict[str, str]:
         "code": "CODE_MODEL",
     }
 
-
+# from .env get the configuration like this
+# {
+#   "api_key": "...",
+#   "base_url": "..."
+# }
 def _get_env_llm_conf(llm_type: str) -> Dict[str, Any]:
     """
     Get LLM configuration from environment variables.
@@ -114,6 +121,7 @@ def _create_llm_use_conf(llm_type: LLMType, conf: Dict[str, Any]) -> BaseChatMod
     env_conf = _get_env_llm_conf(llm_type)
 
     # Merge configurations, with environment variables taking precedence
+    # merge .env and conf.yaml 
     merged_conf = {**llm_conf, **env_conf}
 
     # Filter out unexpected parameters to prevent LangChain warnings (Issue #411)
@@ -132,6 +140,7 @@ def _create_llm_use_conf(llm_type: LLMType, conf: Dict[str, Any]) -> BaseChatMod
     if "token_limit" in merged_conf:
         merged_conf.pop("token_limit")
 
+    # if not configuration at all, raise error
     if not merged_conf:
         raise ValueError(f"No configuration found for LLM type: {llm_type}")
 
@@ -139,6 +148,7 @@ def _create_llm_use_conf(llm_type: LLMType, conf: Dict[str, Any]) -> BaseChatMod
     if "max_retries" not in merged_conf:
         merged_conf["max_retries"] = 3
 
+    # to control whether we need certificate when doing http request
     # Handle SSL verification settings
     verify_ssl = merged_conf.pop("verify_ssl", True)
 
@@ -149,6 +159,7 @@ def _create_llm_use_conf(llm_type: LLMType, conf: Dict[str, Any]) -> BaseChatMod
         merged_conf["http_client"] = http_client
         merged_conf["http_async_client"] = http_async_client
 
+    # 统一接口，平台适配，参数清洗
     # Check if it's Google AI Studio platform based on configuration
     platform = merged_conf.get("platform", "").lower()
     is_google_aistudio = platform == "google_aistudio" or platform == "google-aistudio"

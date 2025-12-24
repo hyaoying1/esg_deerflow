@@ -12,10 +12,18 @@ from .nodes import (
     coder_node,
     coordinator_node,
     human_feedback_node,
+    industrial_researcher_node,
+    check_title_tag_node,
     planner_node,
     reporter_node,
     research_team_node,
     researcher_node,
+    get_content_node,
+    write_introductory_node,
+    process_single_title_node,
+    get_laws_info_node,
+    esg_write_report_node,
+    create_table_of_contents_node
 )
 from .types import State
 
@@ -59,6 +67,14 @@ def _build_base_graph():
     builder.add_node("researcher", researcher_node)
     builder.add_node("analyst", analyst_node)
     builder.add_node("coder", coder_node)
+    builder.add_node("get_content", get_content_node)
+    builder.add_node("check_title_tag", check_title_tag_node)
+    builder.add_node("write_introductory", write_introductory_node)
+    builder.add_node("industrial_researcher", industrial_researcher_node)
+    builder.add_node("process_single_title", process_single_title_node)
+    builder.add_node("get_laws_info", get_laws_info_node)
+    builder.add_node("esg_write_report", esg_write_report_node)
+    builder.add_node("create_table_of_contents", create_table_of_contents_node)
     builder.add_node("human_feedback", human_feedback_node)
     builder.add_edge("background_investigator", "planner")
     builder.add_conditional_edges(

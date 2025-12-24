@@ -1,9 +1,4 @@
-# Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
-# SPDX-License-Identifier: MIT
-
-
 from dataclasses import field
-
 from langgraph.graph import MessagesState
 
 from src.prompts.planner_model import Plan
@@ -11,9 +6,9 @@ from src.rag import Resource
 
 
 class State(MessagesState):
-    """State for the agent system, extends MessagesState with next field."""
+    """Extended global workflow state"""
 
-    # Runtime Variables
+    # === Default LLM workflow variables ===
     locale: str = "en-US"
     research_topic: str = ""
     clarified_research_topic: str = (
@@ -35,9 +30,23 @@ class State(MessagesState):
     clarification_rounds: int = 0
     clarification_history: list[str] = field(default_factory=list)
     is_clarification_complete: bool = False
-    max_clarification_rounds: int = (
-        3  # Default: 3 rounds (only used when enable_clarification=True)
-    )
+    max_clarification_rounds: int = 3
 
-    # Workflow control
-    goto: str = "planner"  # Default next node
+    # === ESG WRITING SPECIFIC FIELDS ===
+    workflow_stage: str = ""
+    esg_report_id: int | None = None
+    esg_tenant_id: int | None = None
+    esg_title_id: int | None = None
+    esg_company_name: str = ""
+    esg_title_datas: str = ""
+    esg_title_contents_raw: str = ""
+    esg_company_industry: str = ""
+    current_sub_title_topics: str = ""
+    law_info_text: str = ""
+    esg_writing_tag: str = ""
+    esg_part_report_result: str = ""
+    esg_part_tables_markdown: list[str] = field(default_factory=list)
+    result: str = ""
+
+    # === Workflow next pointer ===
+    goto: str = "planner"
