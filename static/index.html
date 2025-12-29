@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <title>ESG Report Generator</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 30px;
+      max-width: 900px;
+    }
+    .row {
+      margin: 10px 0;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    label {
+      width: 120px;
+    }
+    input {
+      padding: 6px;
+      width: 200px;
+    }
+    button {
+      padding: 8px 14px;
+      cursor: pointer;
+    }
+    pre {
+      margin-top: 20px;
+      padding: 15px;
+      background: #f6f6f6;
+      white-space: pre-wrap;
+      border-radius: 6px;
+    }
+    .actions {
+      margin-top: 10px;
+      display: none;
+      gap: 10px;
+    }
+    .status {
+      color: #666;
+      font-size: 14px;
+    }
+  </style>
+</head>
+
+<body>
+
+  <h2>ESG 报告生成</h2>
+
+  <!-- ================= 输入区域 ================= -->
+  <div class="row">
+    <label>report_id</label>
+    <input id="report_id" type="number" value="545">
+  </div>
+
+  <div class="row">
+    <label>tenant_id</label>
+    <input id="tenant_id" type="number" value="2">
+  </div>
+
+  <div class="row">
+    <label>title_id</label>
+    <input id="title_id" type="number" value="1">
+  </div>
+
+  <div class="row">
+    <button id="btnGenerate">Generate ESG Report</button>
+    <span id="status" class="status"></span>
+  </div>
+
+  <!-- ================= 生成后操作按钮 ================= -->
+  <div id="actions" class="actions">
+    <!-- <button id="btnPolish">润色</button>
+    <button id="btnTranslate">翻译</button> -->
+  </div>
+
+  <!-- ================= 输出区域 ================= -->
+  <pre id="output">  </pre>
+
+  <!-- ================= JS 逻辑（重点在这里） ================= -->
+  <script>
+    // ===== 工具函数 =====
+    const $ = (id) => document.getElementById(id);
+
+    // ===== 页面元素 =====
+    const btnGenerate = $("btnGenerate");
+    const btnPolish = $("btnPolish");
+    const btnTranslate = $("btnTranslate");
+    const outputEl = $("output");
+    const statusEl = $("status");
+    const actionsEl = $("actions");
+
+    // =====================================================
+    // ⭐ 关键变量：保存「最近一次生成的 ESG 结果」
+    // =====================================================
+    let lastGeneratedResult = null;
+
+    // =====================================================
+    // 1️⃣ 点击「Generate ESG Report」
+    // =====================================================
+    btnGenerate.addEventListener("click", async () => {
+      const report_id = Number($("report_id").value);
+      const tenant_id = Number($("tenant_id").value);
+      const title_id = Number($("title_id").value);
+
+      statusEl.textContent = "生成中，请稍候...";
+      outputEl.textContent = "";
+      actionsEl.style.display = "none";
+      btnGenerate.disabled = true;
+
+      try {
+        const resp = await fetch("/api/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ report_id, tenant_id, title_id })
+        });
+
+        const data = await resp.json();
+
+        if (!data.ok) {
+          throw new Error(data.error || "生成失败");
+        }
+
+        // ⭐ 把生成结果保存起来（给润色用）
+        lastGeneratedResult = data.result;
+
+        outputEl.textContent = JSON.stringify(data.result, null, 2);
+        statusEl.textContent = "生成完成 ✅";
+
+        // 显示「润色 / 翻译」按钮
+        actionsEl.style.display = "flex";
+
+      } catch (err) {
+        outputEl.textContent = String(err);
+        statusEl.textContent = "生成失败 ❌";
+      } finally {
+        btnGenerate.disabled = false;
+      }
+    });
+
+    // =====================================================
+    // 2️⃣ 点击「润色」
+    // =====================================================
+    btnPolish.addEventListener("click", async () => {
+      if (!lastGeneratedResult) {
+        alert("请先生成 ESG 报告");
+        return;
+      }
+
+      const comment = prompt("请输入润色要求：");
+      if (!comment) return;
+
+      statusEl.textContent = "润色中，请稍候...";
+
+      try {
+        const resp = await fetch("/api/polish", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            generated_result: lastGeneratedResult,
+            comment: comment
+          })
+        });
+
+        const data = await resp.json();
+
+        if (!data.ok) {
+          throw new Error(data.error || "润色失败");
+        }
+
+        // 用润色结果覆盖展示
+        outputEl.textContent = JSON.stringify(data.result, null, 2);
+        statusEl.textContent = "润色完成 ✨";
+
+      } catch (err) {
+        alert("润色失败：" + err);
+        statusEl.textContent = "润色失败 ❌";
+      }
+    });
+
+    // =====================================================
+    // 3️⃣ 点击「翻译」（暂不实现）
+    // =====================================================
+    btnTranslate.addEventListener("click", () => {
+      alert("翻译功能：下一步实现");
+    });
+  </script>
+
+</body>
+</html>
